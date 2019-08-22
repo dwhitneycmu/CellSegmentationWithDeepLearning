@@ -6,19 +6,25 @@ Created on Sat Jul 13 22:33:02 2019
 """
 
 import h5py
+import json
 import matplotlib
 import matplotlib.pyplot as plt
+import multiprocessing
 import numpy as np
-import json
 import os
 from PIL import Image
 import sys
 from scipy.spatial import Delaunay
-from scipy.ndimage import binary_erosion, generate_binary_structure
+from scipy import ndimage
 import time
 
 DEFAULT_SAVE_PATH  = os.path.join(os.getcwd(),'temp_imaging_data.h5')
 
+def excludeOverlappedRegions(inputArgs):
+    ROI = inputArgs[0]
+    sharedRegions = inputArgs[1]
+    return np.any(np.prod(ROI==sharedRegions,axis=2),axis=0)            
+                
 def progressBar(value, endvalue, elapsedTime, bar_length=20):
     "Show a progress bar that updates as more imaging data is read"
     # Based on: https://stackoverflow.com/questions/6169217/replace-console-output-in-python
@@ -55,14 +61,19 @@ class imagingDataset():
         imageFiles = [os.path.join(imageDataPath,f) for f in os.listdir(imageDataPath) if f.endswith(imageFileTypes)];
         
         # Get image dimensions and number of frames
-        with Image.open(imageFiles[0]) as img:            
-            (h,w,nFramesPerFile) = (img.height,img.width,img.n_frames)
-        if(nFramesPerFile>1): #isMultipageTIFF
-            nFrames = sum([Image.open(f).n_frames for f in imageFiles])
+        self.imgAverage = [];
+        self.imgStack   = [];        
+        if len(imageFiles)==0:
+            print('No image files found in {}'.format(imageDataPath))
+            return (self.imgAverage,self.imgStack);
         else:
-            nFrames = len(imageFiles)
-        self.imgAverage = np.zeros((h,w))
-        self.imgStack   = []
+            with Image.open(imageFiles[0]) as img:            
+                (h,w,nFramesPerFile) = (img.height,img.width,img.n_frames)
+            if(nFramesPerFile>1): #isMultipageTIFF
+                nFrames = sum([Image.open(f).n_frames for f in imageFiles])
+            else:
+                nFrames = len(imageFiles)
+            self.imgAverage = np.zeros((h,w))
         
         # Loop through and generate an average projection image 
         # (and optionally return entire imaging stack)
@@ -95,9 +106,57 @@ class imagingDataset():
             ROIPath = self.ROIPath
         else:
             self.ROIPath = ROIPath
-        with open(self.ROIPath) as f:
-            ROIData = json.load(f);
-            self.ROIs = [np.array(ROI['coordinates']) for ROI in ROIData]
+        try:
+            with open(self.ROIPath) as f:
+                ROIData = json.load(f);
+                self.ROIs = [np.array(ROI['coordinates']) for ROI in ROIData]
+            return self.ROIs
+        except:
+            print('\nNo ROIs found in {}'.format(ROIPath))
+            self.ROIs = []
+        return self.ROIs;
+    
+    def erodeROIs(self,useXOR=True,useErosion=True,kernel=np.ones((3,3)),useMultiProcessing=True):
+        """Performs XOR on ROIs and erodes filled ROIs by a specified kernel"""
+                
+        # Find and eliminate shared ROI regions
+        ROIs = self.ROIs
+        if useXOR:
+            # Finds pixels that are shared between ROIs
+            (uniqueInstances,nInstances) = np.unique(np.concatenate(ROIs,axis=0),axis=0,return_counts=True)
+            sharedRegions = uniqueInstances[nInstances>1]
+            sharedRegions = np.swapaxes(sharedRegions[:,:,None],1,2) # Swap axes here, so that we can efficiently compared the shared regions with each ROI array
+            uniqueROIs = list()
+            
+            # Identify shared pixels for each ROI
+            if useMultiProcessing:
+                with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+                    overlappedRegions = pool.map(excludeOverlappedRegions, [(ROI,sharedRegions) for ROI in ROIs])
+            else: #This step is very slow without parallelization of some kind
+                 overlappedRegions = [np.any(np.prod(ROI==sharedRegions,axis=2),axis=0) for ROI in ROIs]
+            for (ROI,sharedRegion) in zip(ROIs,overlappedRegions):
+                uniqueROI    = ROI[~sharedRegion]
+                if(sum(uniqueROI.flatten())>1): # Only include ROIs that have a value
+                    uniqueROIs.append(uniqueROI)  
+        else:
+            uniqueROIs = ROIs
+        
+        # Erode ROIs
+        if useErosion:
+            erodedROIs = list()
+            for ROI in uniqueROIs:
+                (up,left)    = ROI.min(axis=0)
+                (down,right) = ROI.max(axis=0)
+                ROIImage = np.zeros((down-up+1,right-left+1),'bool')
+                ROIImage[ROI[:,0]-up,ROI[:,1]-left]=True
+                ROIImage = ndimage.binary_erosion(ROIImage,structure=kernel)
+                boundaryPts = np.array([(i+up,j+left) for i in range(ROIImage.shape[0]) for j in range(ROIImage.shape[1]) if ROIImage[i,j]==1])
+                erodedROIs.append(boundaryPts)  
+        else:
+            erodedROIs = uniqueROIs
+            
+        self.ROIs = erodedROIs
+        return erodedROIs;
             
     def fillROIs(self):
         """Ensures that all cell ROIs are filled (useful if using ImageJ ROIs that just label boundary)"""
@@ -130,7 +189,7 @@ class imagingDataset():
                 (down,right) = ROI.max(axis=0)
                 ROIImage = np.zeros((down-up+1,right-left+1),'bool')
                 ROIImage[ROI[:,0]-up,ROI[:,1]-left]=True
-                ROIImage = np.bitwise_xor(ROIImage,binary_erosion(ROIImage,generate_binary_structure(2,1)))
+                ROIImage = np.bitwise_xor(ROIImage,ndimage.binary_erosion(ROIImage,ndimage.generate_binary_structure(2,1)))
                 boundaryPts = np.array([(i+up,j+left) for i in range(ROIImage.shape[0]) for j in range(ROIImage.shape[1]) if ROIImage[i,j]==1])
             else:
                 # Compute boundary nodes
@@ -150,7 +209,7 @@ class imagingDataset():
             newROIs.append(boundaryPts)   
         self.ROIs = newROIs
         return newROIs;
-            
+                
     def saveToHDF5(self,filePath=DEFAULT_SAVE_PATH):
         "saves data to a hd5f file"
         with h5py.File(filePath, 'w') as file:
@@ -174,7 +233,7 @@ class imagingDataset():
             
     def getLabeledROIMask(self):
         "Returns labeled ROI mask"
-        mask = np.max(np.array([index*ROIMask(ROI,(512,512)).astype('float64') for (index,ROI) in enumerate(self.ROIs)]),axis=0); # Setup a maximum intensity projection of the cellular masks
+        mask = np.max(np.array([(1+index)*ROIMask(ROI,(512,512)).astype('float64') for (index,ROI) in enumerate(self.ROIs)]),axis=0); # Setup a maximum intensity projection of the cellular masks
         return mask
     
     def getReferenceImg(self,zScore=True):
@@ -183,14 +242,26 @@ class imagingDataset():
             img=(img-np.nanmean(img.flatten()))/np.nanstd(img.flatten())
         return img
             
-    def showROIs(self):
+    def showROIs(self,clippingValue=3):
         "Show show cellular ROIs with average z-projection"
-        mask = self.getLabeledROIMask() # Setup a maximum intensity projection of the cellular masks
-        fig,ax=plt.subplots(nrows=1,ncols=2)
-        ax[0].imshow(self.imgAverage,cmap='gray')
-        ax[0].set_title('Average z-projection image')
-        ax[1].imshow(mask,cmap='nipy_spectral')
-        ax[1].set_title('Cell masks')
+        fig,axes=plt.subplots(nrows=1,ncols=3)
+        try:
+            meanImg = np.nanmean(self.imgAverage)
+            stdImg  = np.nanstd(self.imgAverage)
+            for index in [0,2]:
+                axes[index].imshow(self.imgAverage,cmap='gray',vmin=meanImg-clippingValue*stdImg,vmax=meanImg+clippingValue*stdImg)
+                axes[index].set_title('Average z-projection image')
+        except:
+            print('Error: imgAverage not found\n')
+        
+        try:
+            mask = self.getLabeledROIMask() # Setup a maximum intensity projection of the cellular masks
+            for (index,alphaVal) in zip([1,2],[1,0.25]):
+                axes[index].imshow(mask,cmap='nipy_spectral',alpha=alphaVal)
+                axes[index].set_title('Cell masks')
+        except:
+            print('Error: ROIs not found\n')
+        axes[-1].set_title('Overlay')
             
 if __name__ == "__main__":
     baseFolder    = r'D:/Code/ROI Segmentation/DataSets/Neurofinder/neurofinder.00.00/neurofinder.00.00/'
