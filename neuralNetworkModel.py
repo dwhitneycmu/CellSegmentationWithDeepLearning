@@ -5,6 +5,7 @@ Last updated on 6/26/2019
 @author: dwhitney
 """
 
+from imageAugmentation import ImageAugmentation
 from logger import logger, updateDictionary
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,7 +14,7 @@ from PCA import PCA
 import time
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping
 
 # DEFAULT VALUES
 DEFAULT_MODEL_PATH = os.path.join(os.getcwd(),'temp_model.h5')
@@ -29,23 +30,16 @@ DEFAULT_MODEL_PARAMETERS.update({'useBatchNormalization': False}) # Boolean flag
 DEFAULT_MODEL_PARAMETERS.update({'optimizer': 'adam'}) # Training optimizer. Override with object if specific parameters like learning rate or exponential decay function want to be optimized.
 DEFAULT_MODEL_PARAMETERS.update({'loss': 'sparse_categorical_crossentropy'}) # Loss function to minimize during training
 DEFAULT_MODEL_PARAMETERS.update({'metrics': ['accuracy']}) # Metrics to monitor during training
-DEFAULT_TRAINING_OPTIONS = {} # DEFAULT TRAINING OPTIONS. 
-DEFAULT_TRAINING_OPTIONS.update({'epochs': 5})    # Training epochs
-DEFAULT_TRAINING_OPTIONS.update({'batchSize': 0.2}) # Proportion of training set used per epoch (0 to 1)
+DEFAULT_TRAINING_OPTIONS = {} # DEFAULT TRAINING OPTIONS.
+DEFAULT_TRAINING_OPTIONS.update({'blocks': 5})    # Training blocks. Each consists of the full run of training epochs
+DEFAULT_TRAINING_OPTIONS.update({'epochs': 30})    # Training epochs
+DEFAULT_TRAINING_OPTIONS.update({'batchSize': 2}) # Number of images per batch. Will depend on how much memory is on GPU
 DEFAULT_TRAINING_OPTIONS.update({'seed': 1})        # RNG seed
 DEFAULT_TRAINING_OPTIONS.update({'showTrainingData': True}) # Show a subset of training data
 DEFAULT_TRAINING_OPTIONS.update({'subplotDims': [1,1]}) # [5,5]: If showTrainingData==True, then the number of subplots shown are a multiple of (nRows,nCols)==>nSubplots=(nCols)x(nRows)
-DEFAULT_TRAINING_OPTIONS.update({'augmentData': True}) # Boolean flag to augment imaging data
-DEFAULT_TRAINING_OPTIONS.update({'augment_angleRange':    0}) # Range of rotation angles 
-DEFAULT_TRAINING_OPTIONS.update({'augment_shiftRange':    0.1}) # Fraction of total img width/height for (X,Y) shifts
-DEFAULT_TRAINING_OPTIONS.update({'augment_shearRange':    0.1}) # Shearing range
-DEFAULT_TRAINING_OPTIONS.update({'augment_zoomRange':     [0.8,1.25]}) # Zoom range: [lower, upper]
-DEFAULT_TRAINING_OPTIONS.update({'augment_brightRange':   [0.1,1]}) # Brightness range: [lower, upper]. Range for picking the new brightness (relative to the original image), with 1.0 being the original's brightness. Lower must not be smaller than 0.
-DEFAULT_TRAINING_OPTIONS.update({'augment_flipHoriz':     False}) # Boolean flag for horizontal flip
-DEFAULT_TRAINING_OPTIONS.update({'augment_flipVert':      False}) # Boolean flag for vertical flip
-DEFAULT_TRAINING_OPTIONS.update({'augment_fillMode':      'constant'}) # Points outside image boundary are filled with: {"constant", "nearest", "reflect" or "wrap"}
-DEFAULT_TRAINING_OPTIONS.update({'augment_fillVal':       0}) # If augment_fillMode=='constant', points outside image boundary are filled with fillVal
-DEFAULT_TRAINING_OPTIONS.update({'augment_zca_whitening': False}) # Apply ZCA whitening   
+DEFAULT_TRAINING_OPTIONS.update({'augmentData': True}) # Boolean flag to augment imaging data 
+DEFAULT_TRAINING_OPTIONS.update({'verboseMode': 1}) # Integer. 0, 1, or 2. Verbosity mode. 0 = silent, 1 = progress bar, 2 = one line per epoch.
+DEFAULT_TRAINING_OPTIONS.update({'callbacks': []}) # Integer. 0, 1, or 2. Verbosity mode. 0 = silent, 1 = progress bar, 2 = one line per epoch
 
 # Define the default model: a fully, connected dense layer model
 def defaultModel(parameters=DEFAULT_MODEL_PARAMETERS):
@@ -114,7 +108,7 @@ class NeuralNetworkModel:
         self.model.compile(optimizer=self.parameters['optimizer'], loss=self.parameters['loss'], metrics=self.parameters['metrics'])
         
     def trainModel(self, train_data, train_labels, test_data, test_labels, options=DEFAULT_TRAINING_OPTIONS):
-        "Training the model on data"
+        "Training the model on imaging data"
 
         # Ensure that the data shape is rank 4: (Images)x(X)x(Y)x(NChannels)
         if(len(train_data.shape)==3): # If data is not RGB (rank 4), then make rank 4 with last dimension of size 1
@@ -126,25 +120,13 @@ class NeuralNetworkModel:
         self.trainingOptions = options
 
         # Setup training parameters        
-        nAllSamples   = train_labels.shape[0]
-        nTrainSamples = np.ceil(options['batchSize']*nAllSamples).astype('int')
+        nTrainSamples = train_labels.shape[0]
+        nTestSamples  = test_labels.shape[0]
         np.random.seed(options['seed'])
         
         # Data augmentation of imaging data (optional)
         if(options['augmentData']):
-            dataGen = ImageDataGenerator(rotation_range     = options['augment_angleRange'], \
-                                         width_shift_range  = options['augment_shiftRange'], \
-                                         height_shift_range = options['augment_shiftRange'], \
-                                         shear_range        = options['augment_shearRange'], \
-                                         zoom_range         = options['augment_zoomRange'],  \
-                                         brightness_range   = options['augment_brightRange'],\
-                                         horizontal_flip    = options['augment_flipHoriz'],  \
-                                         vertical_flip      = options['augment_flipVert'],   \
-                                         fill_mode          = options['augment_fillMode'],   \
-                                         cval               = options['augment_fillVal'],    \
-                                         zca_whitening      = options['augment_zca_whitening'])
-            if(options['augment_zca_whitening']):
-                dataGen.fit(train_data)
+            dataGenerator = ImageAugmentation(options)
                 
         # Visualize sample training data during each training epoch (optional)
         if(options['showTrainingData']):
@@ -163,43 +145,50 @@ class NeuralNetworkModel:
         self.logger.write("Options: {}".format(options))
         self.logger.write("******************")
         t0 = time.time()
-        modelAccuracy = np.zeros((options['epochs'],2))
-        for training_epoch in range(options['epochs']):
-            self.logger.write("Training epoch: {}/{}".format(training_epoch+1,options['epochs']))
-    
-            # A subset of training imaging samples, an amount specified by nTrainSamples,
-            # are selected from the full training dataset and then optionally augmented
-            trainingSamples = np.random.permutation(nAllSamples)[:nTrainSamples]
-            trainingData  = train_data[trainingSamples,:,:,:]
-            trainLabels   = train_labels[trainingSamples,:,:,:]
-            testingData   = test_data
-            testingLabels = test_labels
-            if(options['augmentData']):
-                seed = training_epoch;
-                trainingData  = dataGen.flow(trainingData , batch_size=trainingData.shape[0],seed=seed).next()
-                trainLabels   = dataGen.flow(trainLabels  , batch_size=trainingData.shape[0],seed=seed).next()/255.
-                testingData   = dataGen.flow(testingData  , batch_size=testingData.shape[0],seed=seed+1).next()
-                testingLabels = dataGen.flow(testingLabels, batch_size=testingData.shape[0],seed=seed+1).next()/255.
-
+        modelLoss     = np.zeros((2,options['blocks']*options['epochs']))
+        modelAccuracy = np.zeros((2,options['blocks']*options['epochs']))
+        for block in range(options['blocks']):
+            self.logger.write("Training block: {}/{}".format(block+1,options['blocks']))
+            
             # Train model using the minibatch approach (with a size equal to nTrainSamples)
-            self.model.fit(trainingData, trainLabels, batch_size=2, epochs=10)
-    
-            # Show some example images (optional)
-            if(options['showTrainingData']):
-                for i,ax in enumerate(axes):
-                    ax.imshow(trainLabels[i,:,:,0], cmap='gray') #plt.cm.binary
-                plt.show()
-                plt.draw() 
-                plt.pause(0.5)
+            if(options['augmentData']):
+                seed = block
+                self.model.fit_generator(dataGenerator.get(train_data,train_labels,options['batchSize'],seed), \
+                                         validation_data=dataGenerator.get(test_data,test_labels,options['batchSize'],seed), \
+                                         steps_per_epoch=np.ceil(nTrainSamples/options['batchSize']), \
+                                         validation_steps=np.ceil(nTestSamples/options['batchSize']), \
+                                         verbose=options['verboseMode'], \
+                                         epochs=options['epochs'], \
+                                         callbacks=options['callbacks'], \
+                                         shuffle=True)
+            else:
+                self.model.fit(x=train_data, y=train_labels, \
+                               validation_data=(test_data,test_labels), \
+                               batch_size=options['batchSize'], \
+                               steps_per_epoch=np.ceil(nTrainSamples/options['batchSize']), \
+                               validation_steps=np.ceil(nTestSamples/options['batchSize']), \
+                               verbose=options['verboseMode'], \
+                               epochs=options['epochs'], \
+                               callbacks=options['callbacks'], \
+                               shuffle=True)
     
             # Evaluate model accuracy
-            train_accuracy = self.model.history.history['acc'][0]
-            (_, test_accuracy)  = self.model.evaluate(testingData, testingLabels)
-            modelAccuracy[training_epoch,:]=[train_accuracy,test_accuracy]
-            self.logger.write("Model accuracy: {} (training) / {} (test)\n".format(train_accuracy,test_accuracy))
+            print(self.model.history.history['acc'])
+            train_loss = self.model.history.history['loss']
+            test_loss  = self.model.history.history['val_loss']
+            train_accuracy = self.model.history.history['acc']
+            test_accuracy  = self.model.history.history['val_acc']
+            indices = block*options['epochs']+np.arange(options['epochs'])
+            modelLoss[:,indices]=[train_loss,test_loss]
+            modelAccuracy[:,indices]=[train_accuracy,test_accuracy]
+            self.logger.write("Model loss: {} (training) / {} (test)\n".format(np.median(train_loss),np.median(test_loss)))
+            self.logger.write("Model accuracy: {} (training) / {} (test)\n".format(np.median(train_accuracy),np.median(test_accuracy)))
+            
+            # Check point model
+            self.saveModel()
         elapsedTime = time.time()-t0
-        self.logger.write('Total elapsed training time: {:4.2f}s (or {:4.2f}s per epoch)'.format(elapsedTime,elapsedTime/options['epochs']))
-        return(modelAccuracy)
+        self.logger.write('Total elapsed training time: {:4.2f}s (or {:4.2f}s per block)'.format(elapsedTime,elapsedTime/options['blocks']))
+        return(modelAccuracy,modelLoss)
 
     def loadModel(self,file_path=DEFAULT_MODEL_PATH):
         # Load a keras model file (*.h5 format) to the specified filePath
