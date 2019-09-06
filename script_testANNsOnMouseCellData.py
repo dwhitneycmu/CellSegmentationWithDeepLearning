@@ -12,25 +12,29 @@ if __name__ == "__main__":
     from scipy import ndimage
     from UNet import UNet
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
+    from PIL import Image
 
     # Load mouse imaging data for training neural network
     plt.close('all')
     reloadData= False
+    #dataFolder  = 'D:/Code/ROI Segmentation/DataSets/Neurofinder/Training Data/saved_data_expt'
     dataFolder  = 'D:/Code/ROI Segmentation/DataSets/Neurofinder/Training Data/saved_data_expt'
     imageSets = []
     nExpts    = 5
     if reloadData:
         # Load imaging data
         for expt in range(nExpts):
-            baseFolder    = 'D:/Code/ROI Segmentation/DataSets/Neurofinder/Training Data/neurofinder.0{0}.00/neurofinder.0{0}.00/'.format(expt,expt)
+            #baseFolder    = 'D:/Code/ROI Segmentation/DataSets/Neurofinder/Training Data/neurofinder.0{0}.00/neurofinder.0{0}.00/'.format(expt,expt)
+            baseFolder    = 'D:/Code/ROI Segmentation/DataSets/Neurofinder/Test Data/neurofinder.0{0}.00.test/neurofinder.0{0}.00.test/'.format(expt,expt)
             imageDataPath = baseFolder+'images/'
-            ROIPath       = baseFolder+'regions/regions.json'
+            ROIPath = '';
+            #ROIPath       = baseFolder+'regions/regions.json'
         
             print('Loading Mouse Dataset #{0}:'.format(expt))
             imageSet=imagingDataset.imagingDataset()
             imageSet.getImagingData(imageDataPath,returnOnlyAverage=True)
             imageSet.getJSONROIs(ROIPath)
-            imageSet.showROIs()
+            #imageSet.showROIs()
             imageSet.saveToHDF5('{0}{1}.h5'.format(dataFolder,expt))
             imageSets.append(imageSet)
     else:
@@ -40,7 +44,10 @@ if __name__ == "__main__":
             imageSet.loadFromHDF5('{0}{1}.h5'.format(dataFolder,expt))
             imageSet.showROIs()
             imageSets.append(imageSet)
-
+            
+            im = Image.fromarray(imageSet.imgAverage)
+            im.save(r'D:\Code\ROI Segmentation\DataSets\Neurofinder\Revised Data\TrainingData_Mouse{}.tif'.format(expt))
+if 0:
     # Setup training dataset
     trainExpts = [0,1,2,4]
     testExpts = [0,1,2,4]

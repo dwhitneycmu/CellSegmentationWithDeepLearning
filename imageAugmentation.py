@@ -9,6 +9,7 @@ from skimage.filters import gaussian
 from logger import updateDictionary
 import numpy as np
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.utils import Sequence
 
 DEFAULT_GENERATOR_OPTIONS = {} # DEFAULT TRAINING OPTIONS. 
 DEFAULT_GENERATOR_OPTIONS.update({'seed': 1})        # RNG seed
@@ -50,43 +51,73 @@ class preProcessFunction():
             if self.options['augment_gaussianNoiseLevel']>0:    
                 img = img+addGaussianNoise(img,self.options['augment_gaussianNoise'])
             imgs[index,:,:,:] = img
-            return imgs        
+            return imgs
 
 class ImageAugmentation():
-    "Class for setting up data augmentation of imaging data for training/testing with TensorFlow" 
+    """Superclass for setting up data augmentation of imaging data for training/testing with TensorFlow.
+    See ImageAugmentationGenerator for use with a Keras Generator and ImageAugmentationSequence for use
+    with a Keras Sequence"""
+    def __init__(self, options={}):
+        self.options = options
+        self.setup()
+
+    def setup(self, options={}):
+        """Initialize a data augmentation generator through Keras"""
+
+        # Update options dictionary with input from user, else use DEFAULT_TRAINING_OPTIONS
+        self.options = updateDictionary(self.options, DEFAULT_GENERATOR_OPTIONS)
+
+        # Initialize generator
+        self.extraProcessing = preProcessFunction(
+            self.options)  # Adds spatial filtering and gaussian noise, but these image operations should not be performed on the mask
+        self.dataGenerator = ImageDataGenerator(rescale=self.options['augment_rescaling'],
+                                                rotation_range=self.options['augment_angleRange'],
+                                                width_shift_range=self.options['augment_shiftRange'],
+                                                height_shift_range=self.options['augment_shiftRange'],
+                                                shear_range=self.options['augment_shearRange'],
+                                                zoom_range=self.options['augment_zoomRange'],
+                                                brightness_range=self.options['augment_brightRange'],
+                                                horizontal_flip=self.options['augment_flipHoriz'],
+                                                vertical_flip=self.options['augment_flipVert'],
+                                                fill_mode=self.options['augment_fillMode'],
+                                                cval=self.options['augment_fillVal'])
+
+class ImageAugmentationGenerator(ImageAugmentation):
+    "Class for setting up data augmentation using a Keras generator"
     def __init__(self,options={}):
         self.options = options
         self.setup()
-            
-    def setup(self,options={}):
-        """Initialize a data augmentation generator through Keras""" 
-        
-        # Update options dictionary with input from user, else use DEFAULT_TRAINING_OPTIONS
-        self.options = updateDictionary(self.options,DEFAULT_GENERATOR_OPTIONS)
-        
-        # Initialize generator
-        self.extraProcessing = preProcessFunction(self.options) # Adds spatial filtering and gaussian noise, but these image operations should not be performed on the mask
-        self.dataGenerator = ImageDataGenerator(rescale = self.options['augment_rescaling'],
-                               rotation_range     = self.options['augment_angleRange'], \
-                               width_shift_range  = self.options['augment_shiftRange'], \
-                               height_shift_range = self.options['augment_shiftRange'], \
-                               shear_range        = self.options['augment_shearRange'], \
-                               zoom_range         = self.options['augment_zoomRange'],  \
-                               brightness_range   = self.options['augment_brightRange'],\
-                               horizontal_flip    = self.options['augment_flipHoriz'],  \
-                               vertical_flip      = self.options['augment_flipVert'],   \
-                               fill_mode          = self.options['augment_fillMode'],   \
-                               cval               = self.options['augment_fillVal'])
 
     def get(self,image_data,image_masks,batch_size,seed):
         """Returns a generator that applies to the image and mask data """
-        
-        imageDataGenerator  = self.dataGenerator.flow(image_data , batch_size=batch_size,seed=seed)
-        imageMasksGenerator = self.dataGenerator.flow(image_masks, batch_size=batch_size,seed=seed)
+
+        imageDataGenerator  = self.dataGenerator.flow(image_data ,batch_size=batch_size,seed=seed)
+        imageMasksGenerator = self.dataGenerator.flow(image_masks,batch_size=batch_size,seed=seed)
         while True:
             imgs  = imageDataGenerator.next()
             imgs  = self.extraProcessing.transform(imgs)
             masks = imageMasksGenerator.next()>0
-            #print('{} - {}'.format(imgs.min(),imgs.max()))
-            #print('{} - {}'.format(masks.min(),masks.max()))
             yield (imgs,masks)
+
+class ImageAugmentationSequence(ImageAugmentation,Sequence):
+    "Class for setting up data augmentation using a Keras sequence"
+    def __init__(self,options={}):
+        self.options = options
+        self.setup()
+
+    def __len__(self):
+        return int(np.ceil(len(self.x) / float(self.batch_size)))
+
+    def __getitem__(self, idx):
+        batch_x = self.x[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_y = self.y[idx * self.batch_size:(idx + 1) * self.batch_size]
+        return batch_x,batch_y
+
+    def generate(self,image_data,image_masks,batch_size,seed):
+        """Generates an internal set of augmented images and mask data """
+        nImgs = image_data.shape[0]
+        self.batch_size = batch_size
+        augmentedData   = self.dataGenerator.flow(image_data , batch_size=nImgs, seed=seed).next()
+        augmentedMasks  = self.dataGenerator.flow(image_masks, batch_size=nImgs, seed=seed).next()
+        self.x = self.extraProcessing.transform(augmentedData)
+        self.y = augmentedMasks>0
